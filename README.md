@@ -47,7 +47,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven { url = uri("https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/") }
+        maven { url = uri("https://raw.githubusercontent.com/kakakakacat/WebpPlayer/mvn-repo/") }
     }
 }
 ```
@@ -65,7 +65,7 @@ dependencies {
 
 ```groovy
 // settings.gradle
-maven { url 'https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/' }
+maven { url 'https://raw.githubusercontent.com/kakakakacat/WebpPlayer/mvn-repo/' }
 // build.gradle
 implementation 'io.webpkit:player:1.0.0'
 ```
@@ -86,7 +86,7 @@ dependencies {
 ### Option C — build from source
 
 ```bash
-git clone https://github.com/QianXingDai/WebpPlayer.git
+git clone https://github.com/kakakakacat/WebpPlayer.git
 cd WebpPlayer
 ./gradlew :webpview:assembleRelease
 # → webpview/build/outputs/aar/webpview-release.aar
