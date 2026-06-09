@@ -56,7 +56,7 @@ App `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("io.webpkit:player:1.0.0")
+    implementation("io.webpkit:player:1.0.1")
 }
 ```
 
@@ -67,17 +67,17 @@ dependencies {
 // settings.gradle
 maven { url 'https://raw.githubusercontent.com/kakakakacat/WebpPlayer/mvn-repo/' }
 // build.gradle
-implementation 'io.webpkit:player:1.0.0'
+implementation 'io.webpkit:player:1.0.1'
 ```
 </details>
 
 ### Option B — drop in the AAR manually
 
-Copy `player-1.0.0.aar` into your app's `libs/` folder and add:
+Copy `player-1.0.1.aar` into your app's `libs/` folder and add:
 
 ```kotlin
 dependencies {
-    implementation(files("libs/player-1.0.0.aar"))
+    implementation(files("libs/player-1.0.1.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 }
