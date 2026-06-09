@@ -1,5 +1,7 @@
 # WebpKit Player
 
+English | [简体中文](README.zh-CN.md)
+
 A self-contained Android library for high-performance **animated WebP** playback,
 built on a trimmed, bundled copy of [libwebp](https://chromium.googlesource.com/webm/libwebp)
 (encoder + decoder source) compiled to a native `.so`.
