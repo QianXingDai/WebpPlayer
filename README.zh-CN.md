@@ -33,20 +33,55 @@
 
 ## 接入
 
-### 方式 A —— 直接丢 AAR
+### 方式 A —— Gradle 依赖（推荐，自动下载）
 
-把 `webpview-release.aar` 拷进 App 的 `libs/` 目录，然后：
+加一个仓库地址，再加一行依赖即可。传递依赖（coroutines、lifecycle）会通过发布的 POM
+自动带入，无需手动声明。
+
+`settings.gradle.kts`（或工程级 `build.gradle`）：
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/") }
+    }
+}
+```
+
+App 的 `build.gradle.kts`：
 
 ```kotlin
 dependencies {
-    implementation(files("libs/webpview-release.aar"))
-    // AAR 需要的传递依赖：
+    implementation("io.webpkit:player:1.0.0")
+}
+```
+
+<details>
+<summary>Groovy DSL 写法</summary>
+
+```groovy
+// settings.gradle
+maven { url 'https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/' }
+// build.gradle
+implementation 'io.webpkit:player:1.0.0'
+```
+</details>
+
+### 方式 B —— 手动丢 AAR
+
+把 `player-1.0.0.aar` 拷进 App 的 `libs/` 目录，然后：
+
+```kotlin
+dependencies {
+    implementation(files("libs/player-1.0.0.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 }
 ```
 
-### 方式 B —— 从源码构建
+### 方式 C —— 从源码构建
 
 ```bash
 git clone https://github.com/QianXingDai/WebpPlayer.git

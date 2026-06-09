@@ -35,20 +35,55 @@ platform `ImageDecoder` / `AnimatedImageDrawable` pipeline.
 
 ## Install
 
-### Option A — drop in the AAR
+### Option A — Gradle dependency (recommended, auto-download)
 
-Copy `webpview-release.aar` into your app's `libs/` folder and add:
+Add the repository, then one line for the dependency. Transitive deps
+(coroutines, lifecycle) are pulled in automatically via the published POM.
+
+`settings.gradle.kts` (or your project `build.gradle`):
+
+```kotlin
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url = uri("https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/") }
+    }
+}
+```
+
+App `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation(files("libs/webpview-release.aar"))
-    // transitive deps the AAR needs:
+    implementation("io.webpkit:player:1.0.0")
+}
+```
+
+<details>
+<summary>Groovy DSL</summary>
+
+```groovy
+// settings.gradle
+maven { url 'https://raw.githubusercontent.com/QianXingDai/WebpPlayer/mvn-repo/' }
+// build.gradle
+implementation 'io.webpkit:player:1.0.0'
+```
+</details>
+
+### Option B — drop in the AAR manually
+
+Copy `player-1.0.0.aar` into your app's `libs/` folder and add:
+
+```kotlin
+dependencies {
+    implementation(files("libs/player-1.0.0.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 }
 ```
 
-### Option B — build from source
+### Option C — build from source
 
 ```bash
 git clone https://github.com/QianXingDai/WebpPlayer.git

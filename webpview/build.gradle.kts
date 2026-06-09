@@ -66,6 +66,19 @@ dependencies {
     implementation("androidx.annotation:annotation:1.6.0")
 }
 
+publishing {
+    repositories {
+        // Publishes into a plain folder that we serve as a Maven repo via GitHub raw
+        // (the `mvn-repo` branch). Override with -PrepoDir=/path if needed.
+        maven {
+            name = "fileRepo"
+            val repoDir = (findProperty("repoDir") as String?)
+                ?: rootProject.layout.projectDirectory.dir("mvn-repo").asFile.absolutePath
+            url = uri(repoDir)
+        }
+    }
+}
+
 afterEvaluate {
     publishing {
         publications {
