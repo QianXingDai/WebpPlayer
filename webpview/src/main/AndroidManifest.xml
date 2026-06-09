@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Zero-config context capture so consumers don't need to call an init(). -->
+        <provider
+            android:name="io.webpkit.player.WebpInitProvider"
+            android:authorities="${applicationId}.webpkit.init"
+            android:exported="false"
+            android:initOrder="100" />
+    </application>
+
+</manifest>
