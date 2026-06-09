@@ -86,7 +86,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "io.webpkit"
                 artifactId = "player"
-                version = "1.0.0"
+                version = "1.0.1"
             }
         }
     }
