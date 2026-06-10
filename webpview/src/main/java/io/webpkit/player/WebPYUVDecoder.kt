@@ -1,12 +1,22 @@
 package io.webpkit.player
 
 import android.content.Context
+import android.hardware.HardwareBuffer
 import android.util.Size
 import java.nio.ByteBuffer
 
 object WebPYUVDecoder {
 
     private const val TAG = "WebPYUVDecoder"
+
+    /**
+     * 零拷贝路径总开关：帧解码直写 AHardwareBuffer，渲染经 EGLImage 直接采样，
+     * 播放期间没有任何逐帧 CPU 拷贝。遇到兼容性问题可在运行时关掉，
+     * 自动回退到 ByteBuffer + glTexSubImage2D 的软路径。
+     */
+    @JvmStatic
+    @Volatile
+    var hardwareBuffersEnabled: Boolean = true
 
     /**
      * 原生库是否加载成功。当以 aar 形式集成却没有把 libwebpkit.so 打进包里时，
@@ -47,6 +57,28 @@ object WebPYUVDecoder {
         targetHeight: Int,
     ): WebPAnimResult?
 
+    // JNI: 同上，preferHardware=true 时帧直写 AHardwareBuffer（结果在 hardwareFrames），
+    // 硬件分配失败自动回退软路径
+    external fun decodeAllFramesDirectEx(
+        data: ByteBuffer,
+        dataSize: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        preferHardware: Boolean,
+    ): WebPAnimResult?
+
+    // JNI: HardwareBuffer 帧的 clone——每帧生成新的 Java 包装、各自持有底层
+    // AHardwareBuffer 的一个引用（零拷贝），释放用 HardwareBuffer.close()
+    external fun cloneHardwareBuffers(frames: Array<HardwareBuffer>?): Array<HardwareBuffer>?
+
+    // JNI: EGLImage 桥（必须在 GL 线程调用）
+    external fun eglImageCreate(buffer: HardwareBuffer): Long
+    external fun eglImageTargetTexture2D(image: Long)
+    external fun eglImageDestroy(image: Long)
+
+    // JNI: EGLImage 不可用时的兜底——锁定 AHB 按行上传到当前绑定纹理
+    external fun uploadHardwareBufferToTexture(buffer: HardwareBuffer, width: Int, height: Int): Boolean
+
     // JNI: releaseNativeBuffers(frames: Array<ByteBuffer?>) -> Int (返回释放的KB数)
     // frees malloc'ed pointers backing NewDirectByteBuffer and returns freed memory in KB
     external fun releaseNativeBuffers(frames: Array<ByteBuffer>?): Int
@@ -81,11 +113,12 @@ object WebPYUVDecoder {
         WebpLog.d(TAG, "decodeRawWebPToAnim: resId=$resId, bytes=${data.capacity()}, targetSize=$targetSize")
 
         val result = try {
-            decodeAllFramesDirect(
+            decodeAllFramesDirectEx(
                 data,
                 data.capacity(),
                 targetSize?.width ?: 0,
                 targetSize?.height ?: 0,
+                hardwareBuffersEnabled,
             )
         } catch (t: Throwable) {
             WebpLog.e(TAG, "decode failed: ${t.message}", t)
@@ -96,11 +129,11 @@ object WebPYUVDecoder {
             WebpLog.e(TAG, "decode returned null (resId=$resId)")
             return null
         }
-        val frameCount = result.frames?.size ?: 0
+        val frameCount = result.frameCount
         if (frameCount == 0) {
             WebpLog.w(TAG, "decode 成功但 0 帧 (resId=$resId, canvas=${result.canvasWidth}x${result.canvasHeight}) —— 将不会显示任何内容")
         }
-        WebpLog.d(TAG, "Decoded anim: $frameCount frames, canvas=${result.canvasWidth}x${result.canvasHeight}, targetSize=$targetSize")
+        WebpLog.d(TAG, "Decoded anim: $frameCount frames (hw=${result.hardwareFrames != null}), canvas=${result.canvasWidth}x${result.canvasHeight}, targetSize=$targetSize")
         return result
     }
 }

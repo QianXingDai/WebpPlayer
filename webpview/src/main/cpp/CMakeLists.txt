@@ -79,4 +79,5 @@ target_link_options(webpkit PRIVATE
 )
 
 find_library(log-lib log)
-target_link_libraries(webpkit ${log-lib} android)
+# EGL/GLESv2/nativewindow: AHardwareBuffer + EGLImage zero-copy frame path
+target_link_libraries(webpkit ${log-lib} android EGL GLESv2 nativewindow)

@@ -1,5 +1,11 @@
 #include <jni.h>
 #include <android/log.h>
+#include <android/hardware_buffer.h>
+#include <android/hardware_buffer_jni.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include "webp/demux.h"
 #include "webp/decode.h"
 #include "libyuv/scale_argb.h"
@@ -97,6 +103,137 @@ void ScaleRgbaFrame(
       libyuv::kFilterBilinear);
 }
 
+// ---------------------------------------------------------------------------
+// AHardwareBuffer frame storage (zero-copy GPU path).
+//
+// Frames are decoded straight into AHardwareBuffers (CPU/GPU shared memory).
+// The renderer wraps each one in an EGLImage and samples it directly — no
+// per-frame glTexSubImage2D upload, no staging copy, ever. Lifetime rides on
+// AHardwareBuffer's own refcount: every Java HardwareBuffer wrapper holds one
+// reference, clone = new wrapper, release = HardwareBuffer.close().
+// ---------------------------------------------------------------------------
+
+// Writes one decoded canvas (scaled if needed) into a fresh AHardwareBuffer
+// and returns a Java HardwareBuffer that owns it. Returns null on failure.
+jobject WriteFrameToHardwareBuffer(
+    JNIEnv* env,
+    const uint8_t* canvas,
+    int origW,
+    int origH,
+    int finalW,
+    int finalH,
+    bool needScale) {
+  AHardwareBuffer_Desc desc = {};
+  desc.width = static_cast<uint32_t>(finalW);
+  desc.height = static_cast<uint32_t>(finalH);
+  desc.layers = 1;
+  desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+  // CPU_READ_RARELY keeps a software-upload escape hatch for devices where
+  // EGLImage creation fails at render time.
+  desc.usage = AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
+               AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY |
+               AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+
+  AHardwareBuffer* ahb = nullptr;
+  if (AHardwareBuffer_allocate(&desc, &ahb) != 0 || ahb == nullptr) {
+    LOGE("WriteFrameToHardwareBuffer: allocate failed (%dx%d)", finalW, finalH);
+    return nullptr;
+  }
+
+  void* dst = nullptr;
+  if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY, -1, nullptr, &dst) != 0 ||
+      dst == nullptr) {
+    LOGE("WriteFrameToHardwareBuffer: lock failed");
+    AHardwareBuffer_release(ahb);
+    return nullptr;
+  }
+
+  AHardwareBuffer_Desc actual = {};
+  AHardwareBuffer_describe(ahb, &actual);
+  const int dstStrideBytes = static_cast<int>(actual.stride) * 4;
+
+  if (needScale) {
+    // libyuv handles the destination stride natively
+    libyuv::ARGBScale(
+        canvas, origW * 4, origW, origH,
+        static_cast<uint8_t*>(dst), dstStrideBytes, finalW, finalH,
+        libyuv::kFilterBilinear);
+  } else if (static_cast<int>(actual.stride) == finalW) {
+    std::memcpy(dst, canvas, static_cast<size_t>(finalW) * finalH * 4);
+  } else {
+    for (int y = 0; y < finalH; ++y) {
+      std::memcpy(
+          static_cast<uint8_t*>(dst) + static_cast<size_t>(y) * dstStrideBytes,
+          canvas + static_cast<size_t>(y) * finalW * 4,
+          static_cast<size_t>(finalW) * 4);
+    }
+  }
+
+  AHardwareBuffer_unlock(ahb, nullptr);
+
+  jobject wrapper = AHardwareBuffer_toHardwareBuffer(env, ahb);
+  // The Java wrapper holds its own reference; drop the allocation reference so
+  // the wrapper is the sole owner.
+  AHardwareBuffer_release(ahb);
+  if (wrapper == nullptr) {
+    LOGE("WriteFrameToHardwareBuffer: toHardwareBuffer failed");
+  }
+  return wrapper;
+}
+
+// Calls HardwareBuffer.close() on every non-null element (rollback helper).
+void CloseHardwareBuffersInArray(JNIEnv* env, jobjectArray array) {
+  if (array == nullptr) return;
+  jclass hbCls = env->FindClass("android/hardware/HardwareBuffer");
+  if (hbCls == nullptr) return;
+  jmethodID closeMethod = env->GetMethodID(hbCls, "close", "()V");
+  env->DeleteLocalRef(hbCls);
+  if (closeMethod == nullptr) return;
+  const jsize len = env->GetArrayLength(array);
+  for (jsize i = 0; i < len; ++i) {
+    jobject hb = env->GetObjectArrayElement(array, i);
+    if (hb == nullptr) continue;
+    env->CallVoidMethod(hb, closeMethod);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    env->DeleteLocalRef(hb);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// EGLImage helpers (must run on the GL thread). Extension entry points are
+// resolved once via eglGetProcAddress.
+// ---------------------------------------------------------------------------
+
+PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC p_eglGetNativeClientBufferANDROID = nullptr;
+PFNEGLCREATEIMAGEKHRPROC p_eglCreateImageKHR = nullptr;
+PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR = nullptr;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES = nullptr;
+std::once_flag g_egl_init_flag;
+bool g_egl_ready = false;
+
+bool EnsureEglProcs() {
+  std::call_once(g_egl_init_flag, [] {
+    p_eglGetNativeClientBufferANDROID =
+        reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+            eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+    p_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(
+        eglGetProcAddress("eglCreateImageKHR"));
+    p_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
+        eglGetProcAddress("eglDestroyImageKHR"));
+    p_glEGLImageTargetTexture2DOES =
+        reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+            eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    g_egl_ready = p_eglGetNativeClientBufferANDROID != nullptr &&
+                  p_eglCreateImageKHR != nullptr &&
+                  p_eglDestroyImageKHR != nullptr &&
+                  p_glEGLImageTargetTexture2DOES != nullptr;
+    if (!g_egl_ready) {
+      LOGE("EnsureEglProcs: EGLImage extensions unavailable, falling back to software upload");
+    }
+  });
+  return g_egl_ready;
+}
+
 // Aspect-fit the original canvas inside the target box. Never upscales: a
 // target larger than the source keeps the original size (GPU sampling handles
 // magnification for free). Output dimensions are kept even (legacy contract of
@@ -134,6 +271,8 @@ void ReleaseAll(std::vector<void*>& buffers) {
 // Shared decode core. targetW/targetH <= 0 means "original size".
 // Any per-frame failure fails the whole decode: callers must never receive a
 // frame array with null holes (the Kotlin side types elements as non-null).
+// useHardwareBuffers: frames go into AHardwareBuffers (HardwareBuffer[] in the
+// result) instead of malloc'd direct ByteBuffers.
 // ---------------------------------------------------------------------------
 
 jobject DecodeAllFramesCore(
@@ -141,7 +280,8 @@ jobject DecodeAllFramesCore(
     const uint8_t* bytes,
     size_t size,
     int targetW,
-    int targetH) {
+    int targetH,
+    bool useHardwareBuffers) {
   if (bytes == nullptr || size == 0) {
     LOGE("decode: empty input");
     return nullptr;
@@ -181,15 +321,16 @@ jobject DecodeAllFramesCore(
   const bool needScale = (finalW != origW || finalH != origH);
   const size_t frameSize = static_cast<size_t>(finalW) * static_cast<size_t>(finalH) * 4;
 
-  jclass byteBufferCls = env->FindClass("java/nio/ByteBuffer");
-  if (byteBufferCls == nullptr) {
-    LOGE("decode: Failed to find ByteBuffer class");
+  jclass elemCls = env->FindClass(
+      useHardwareBuffers ? "android/hardware/HardwareBuffer" : "java/nio/ByteBuffer");
+  if (elemCls == nullptr) {
+    LOGE("decode: Failed to find frame element class");
     WebPAnimDecoderDelete(dec);
     return nullptr;
   }
 
-  jobjectArray frameArray = env->NewObjectArray(frameCount, byteBufferCls, nullptr);
-  env->DeleteLocalRef(byteBufferCls);
+  jobjectArray frameArray = env->NewObjectArray(frameCount, elemCls, nullptr);
+  env->DeleteLocalRef(elemCls);
   if (frameArray == nullptr) {
     LOGE("decode: Failed to create frame array");
     WebPAnimDecoderDelete(dec);
@@ -213,6 +354,17 @@ jobject DecodeAllFramesCore(
     }
     durations[i] = timestamp - prevTimestamp;
     prevTimestamp = timestamp;
+
+    if (useHardwareBuffers) {
+      jobject hb = WriteFrameToHardwareBuffer(env, canvas, origW, origH, finalW, finalH, needScale);
+      if (hb == nullptr) {
+        failed = true;
+        break;
+      }
+      env->SetObjectArrayElement(frameArray, i, hb);
+      env->DeleteLocalRef(hb);
+      continue;
+    }
 
     uint8_t* out = static_cast<uint8_t*>(AllocateOwnedBuffer(frameSize));
     if (out == nullptr) {
@@ -242,24 +394,32 @@ jobject DecodeAllFramesCore(
 
   if (failed) {
     ReleaseAll(allocated_buffers);
+    if (useHardwareBuffers) CloseHardwareBuffersInArray(env, frameArray);
     env->DeleteLocalRef(frameArray);
     return nullptr;
   }
+
+  // Frees everything accumulated so far (both modes); used by failure paths below.
+  auto cleanupFrames = [&]() {
+    ReleaseAll(allocated_buffers);
+    if (useHardwareBuffers) CloseHardwareBuffersInArray(env, frameArray);
+    env->DeleteLocalRef(frameArray);
+  };
 
   jclass resultCls = env->FindClass("io/webpkit/player/WebPAnimResult");
   if (resultCls == nullptr) {
     LOGE("decode: Failed to find WebPAnimResult class");
-    ReleaseAll(allocated_buffers);
-    env->DeleteLocalRef(frameArray);
+    cleanupFrames();
     return nullptr;
   }
 
-  jmethodID ctor = env->GetMethodID(resultCls, "<init>", "([Ljava/nio/ByteBuffer;II[II)V");
+  jmethodID ctor = env->GetMethodID(
+      resultCls, "<init>",
+      "([Ljava/nio/ByteBuffer;[Landroid/hardware/HardwareBuffer;II[II)V");
   if (ctor == nullptr) {
     LOGE("decode: Failed to find WebPAnimResult constructor");
     env->DeleteLocalRef(resultCls);
-    ReleaseAll(allocated_buffers);
-    env->DeleteLocalRef(frameArray);
+    cleanupFrames();
     return nullptr;
   }
 
@@ -267,18 +427,22 @@ jobject DecodeAllFramesCore(
   if (jdur == nullptr) {
     LOGE("decode: Failed to create duration array");
     env->DeleteLocalRef(resultCls);
-    ReleaseAll(allocated_buffers);
-    env->DeleteLocalRef(frameArray);
+    cleanupFrames();
     return nullptr;
   }
   if (frameCount > 0) {
     env->SetIntArrayRegion(jdur, 0, frameCount, durations.data());
   }
 
-  jobject result = env->NewObject(resultCls, ctor, frameArray, finalW, finalH, jdur, loopCount);
+  jobject result = env->NewObject(
+      resultCls, ctor,
+      useHardwareBuffers ? nullptr : frameArray,
+      useHardwareBuffers ? frameArray : nullptr,
+      finalW, finalH, jdur, loopCount);
   if (result == nullptr) {
     LOGE("decode: Failed to create WebPAnimResult object");
     ReleaseAll(allocated_buffers);
+    if (useHardwareBuffers) CloseHardwareBuffersInArray(env, frameArray);
   }
 
   env->DeleteLocalRef(resultCls);
@@ -395,7 +559,8 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFrames(JNIEnv* env, jobject, jbyt
   const jsize length = env->GetArrayLength(data);
 
   jobject result = DecodeAllFramesCore(
-      env, reinterpret_cast<const uint8_t*>(input), static_cast<size_t>(length), 0, 0);
+      env, reinterpret_cast<const uint8_t*>(input), static_cast<size_t>(length), 0, 0,
+      /*useHardwareBuffers=*/false);
 
   env->ReleaseByteArrayElements(data, input, JNI_ABORT);
   return result;
@@ -415,7 +580,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesWithSize(
 
   jobject result = DecodeAllFramesCore(
       env, reinterpret_cast<const uint8_t*>(input), static_cast<size_t>(length),
-      targetWidth, targetHeight);
+      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
 
   env->ReleaseByteArrayElements(data, input, JNI_ABORT);
   return result;
@@ -442,7 +607,152 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirect(
   }
   return DecodeAllFramesCore(
       env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
-      targetWidth, targetHeight);
+      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
+}
+
+// Like decodeAllFramesDirect, with an opt-in zero-copy mode: frames decode
+// straight into AHardwareBuffers (HardwareBuffer[] in the result) for
+// EGLImage-backed rendering. Falls back to the software ByteBuffer path if
+// any hardware allocation fails.
+JNIEXPORT jobject JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirectEx(
+    JNIEnv* env,
+    jobject,
+    jobject buffer,
+    jint dataSize,
+    jint targetWidth,
+    jint targetHeight,
+    jboolean preferHardware) {
+  if (buffer == nullptr || dataSize <= 0) return nullptr;
+  void* addr = env->GetDirectBufferAddress(buffer);
+  const jlong cap = env->GetDirectBufferCapacity(buffer);
+  if (addr == nullptr || cap < static_cast<jlong>(dataSize)) {
+    LOGE("decodeAllFramesDirectEx: invalid direct buffer (cap=%lld, size=%d)",
+         (long long)cap, (int)dataSize);
+    return nullptr;
+  }
+
+  if (preferHardware == JNI_TRUE) {
+    jobject result = DecodeAllFramesCore(
+        env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
+        targetWidth, targetHeight, /*useHardwareBuffers=*/true);
+    if (result != nullptr) return result;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    LOGE("decodeAllFramesDirectEx: hardware-buffer path failed, falling back to software");
+  }
+
+  return DecodeAllFramesCore(
+      env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
+      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
+}
+
+// Clone = one new Java HardwareBuffer wrapper per frame, each holding its own
+// reference to the same underlying AHardwareBuffer. All-or-nothing.
+JNIEXPORT jobjectArray JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_cloneHardwareBuffers(
+    JNIEnv* env, jobject, jobjectArray frameArray) {
+  if (frameArray == nullptr) return nullptr;
+
+  jclass hbCls = env->FindClass("android/hardware/HardwareBuffer");
+  if (hbCls == nullptr) return nullptr;
+  const jsize len = env->GetArrayLength(frameArray);
+  jobjectArray cloned = env->NewObjectArray(len, hbCls, nullptr);
+  env->DeleteLocalRef(hbCls);
+  if (cloned == nullptr) return nullptr;
+
+  for (jsize i = 0; i < len; ++i) {
+    jobject hb = env->GetObjectArrayElement(frameArray, i);
+    if (hb == nullptr) continue;
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hb);
+    env->DeleteLocalRef(hb);
+    if (ahb == nullptr) {
+      LOGE("cloneHardwareBuffers: fromHardwareBuffer failed at index %d", (int)i);
+      CloseHardwareBuffersInArray(env, cloned);
+      env->DeleteLocalRef(cloned);
+      return nullptr;
+    }
+    jobject wrapper = AHardwareBuffer_toHardwareBuffer(env, ahb);
+    if (wrapper == nullptr) {
+      LOGE("cloneHardwareBuffers: toHardwareBuffer failed at index %d", (int)i);
+      CloseHardwareBuffersInArray(env, cloned);
+      env->DeleteLocalRef(cloned);
+      return nullptr;
+    }
+    env->SetObjectArrayElement(cloned, i, wrapper);
+    env->DeleteLocalRef(wrapper);
+  }
+  return cloned;
+}
+
+// ---- EGLImage bridge (GL thread only) ----
+
+JNIEXPORT jlong JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_eglImageCreate(
+    JNIEnv* env, jobject, jobject hardwareBuffer) {
+  if (hardwareBuffer == nullptr || !EnsureEglProcs()) return 0;
+  AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardwareBuffer);
+  if (ahb == nullptr) return 0;
+  EGLClientBuffer clientBuf = p_eglGetNativeClientBufferANDROID(ahb);
+  if (clientBuf == nullptr) return 0;
+  const EGLint attrs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+  EGLImageKHR image = p_eglCreateImageKHR(
+      eglGetDisplay(EGL_DEFAULT_DISPLAY), EGL_NO_CONTEXT,
+      EGL_NATIVE_BUFFER_ANDROID, clientBuf, attrs);
+  if (image == EGL_NO_IMAGE_KHR) {
+    LOGE("eglImageCreate: eglCreateImageKHR failed (0x%x)", eglGetError());
+    return 0;
+  }
+  return reinterpret_cast<jlong>(image);
+}
+
+// Binds the EGLImage as the storage of the currently bound GL_TEXTURE_2D.
+JNIEXPORT void JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_eglImageTargetTexture2D(
+    JNIEnv*, jobject, jlong image) {
+  if (image != 0 && EnsureEglProcs()) {
+    p_glEGLImageTargetTexture2DOES(
+        GL_TEXTURE_2D, reinterpret_cast<GLeglImageOES>(image));
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_eglImageDestroy(
+    JNIEnv*, jobject, jlong image) {
+  if (image != 0 && EnsureEglProcs()) {
+    p_eglDestroyImageKHR(
+        eglGetDisplay(EGL_DEFAULT_DISPLAY), reinterpret_cast<EGLImageKHR>(image));
+  }
+}
+
+// Software escape hatch when EGLImage creation fails: locks the buffer for CPU
+// read and uploads into the currently bound (and pre-allocated) texture.
+JNIEXPORT jboolean JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_uploadHardwareBufferToTexture(
+    JNIEnv* env, jobject, jobject hardwareBuffer, jint width, jint height) {
+  if (hardwareBuffer == nullptr || width <= 0 || height <= 0) return JNI_FALSE;
+  AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardwareBuffer);
+  if (ahb == nullptr) return JNI_FALSE;
+  void* src = nullptr;
+  if (AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, nullptr, &src) != 0 ||
+      src == nullptr) {
+    return JNI_FALSE;
+  }
+  AHardwareBuffer_Desc desc = {};
+  AHardwareBuffer_describe(ahb, &desc);
+  if (static_cast<jint>(desc.stride) == width) {
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, src);
+  } else {
+    // GLES2 has no UNPACK_ROW_LENGTH: upload row by row
+    for (jint y = 0; y < height; ++y) {
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, width, 1,
+                      GL_RGBA, GL_UNSIGNED_BYTE,
+                      static_cast<const uint8_t*>(src) +
+                          static_cast<size_t>(y) * desc.stride * 4);
+    }
+  }
+  AHardwareBuffer_unlock(ahb, nullptr);
+  return JNI_TRUE;
 }
 
 #ifdef __cplusplus

@@ -196,15 +196,32 @@ object WebPAnimResultManager {
     }
 
     private fun releaseAnimResult(anim: WebPAnimResult?) {
-        val frames = anim?.frames ?: return
-        runCatching {
-            releaseFramesDelegate(frames)
-        }.onFailure {
-            logE("release anim failed: ${it.message}")
+        if (anim == null) return
+        anim.frames?.let { frames ->
+            runCatching {
+                releaseFramesDelegate(frames)
+            }.onFailure {
+                logE("release anim failed: ${it.message}")
+            }
+        }
+        anim.hardwareFrames?.forEach { hb ->
+            runCatching { if (!hb.isClosed) hb.close() }
         }
     }
 
     private fun cloneAnimResultInternal(anim: WebPAnimResult): WebPAnimResult? {
+        // 硬件帧：clone = 每帧一个新 Java 包装，各自引用同一块 AHardwareBuffer（零拷贝）
+        anim.hardwareFrames?.let { hwFrames ->
+            val clonedHw = WebPYUVDecoder.cloneHardwareBuffers(hwFrames) ?: return null
+            return WebPAnimResult(
+                frames = null,
+                hardwareFrames = clonedHw,
+                canvasWidth = anim.canvasWidth,
+                canvasHeight = anim.canvasHeight,
+                durations = anim.durations.copyOf(),
+                loopCount = anim.loopCount,
+            )
+        }
         val frames = anim.frames ?: return WebPAnimResult(
             frames = null,
             canvasWidth = anim.canvasWidth,
@@ -263,6 +280,9 @@ object WebPAnimResultManager {
     }
 
     private fun estimateAnimBytes(anim: WebPAnimResult): Long {
+        anim.hardwareFrames?.let {
+            return it.size.toLong() * anim.canvasWidth * anim.canvasHeight * 4
+        }
         return anim.frames?.sumOf { it.capacity().toLong() } ?: 0L
     }
 }
