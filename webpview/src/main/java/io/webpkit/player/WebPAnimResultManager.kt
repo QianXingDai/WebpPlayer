@@ -210,13 +210,16 @@ object WebPAnimResultManager {
             canvasWidth = anim.canvasWidth,
             canvasHeight = anim.canvasHeight,
             durations = anim.durations.copyOf(),
+            loopCount = anim.loopCount,
         )
+        // native 侧 clone 是引用计数 +1（共享同一块帧内存），不再是深拷贝
         val clonedFrames = WebPYUVDecoder.cloneNativeBuffers(frames) ?: return null
         return WebPAnimResult(
             frames = clonedFrames,
             canvasWidth = anim.canvasWidth,
             canvasHeight = anim.canvasHeight,
             durations = anim.durations.copyOf(),
+            loopCount = anim.loopCount,
         )
     }
 

@@ -38,6 +38,15 @@ object WebPYUVDecoder {
     // JNI: 新增方法，解码为指定尺寸（targetWidth/targetHeight > 0 时缩放）
     external fun decodeAllFramesWithSize(data: ByteArray, targetWidth: Int, targetHeight: Int): WebPAnimResult?
 
+    // JNI: direct ByteBuffer 直传版本——native 直接读 buffer 地址，解码全程不 pin/拷贝 Java 数组。
+    // targetWidth/targetHeight <= 0 时按原始尺寸解码。
+    external fun decodeAllFramesDirect(
+        data: ByteBuffer,
+        dataSize: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+    ): WebPAnimResult?
+
     // JNI: releaseNativeBuffers(frames: Array<ByteBuffer?>) -> Int (返回释放的KB数)
     // frees malloc'ed pointers backing NewDirectByteBuffer and returns freed memory in KB
     external fun releaseNativeBuffers(frames: Array<ByteBuffer>?): Int
@@ -52,29 +61,32 @@ object WebPYUVDecoder {
             return null
         }
 
-        val bytes = try {
-            context.resources.openRawResource(resId).use { it.readBytes() }
+        val data = try {
+            context.resources.openRawResource(resId).use { input ->
+                val bytes = input.readBytes()
+                if (bytes.isEmpty()) {
+                    WebpLog.e(TAG, "decodeRawWebPToAnim: raw 资源为空 resId=$resId")
+                    return null
+                }
+                // 拷进 direct buffer，native 侧零拷贝读取，解码全程不与 GC 交互
+                ByteBuffer.allocateDirect(bytes.size).apply {
+                    put(bytes)
+                    position(0)
+                }
+            }
         } catch (t: Throwable) {
             WebpLog.e(TAG, "读取 raw 资源失败 resId=$resId: ${t.message}", t)
             return null
         }
-        WebpLog.d(TAG, "decodeRawWebPToAnim: resId=$resId, bytes=${bytes.size}, targetSize=$targetSize")
-        if (bytes.isEmpty()) {
-            WebpLog.e(TAG, "decodeRawWebPToAnim: raw 资源为空 resId=$resId")
-            return null
-        }
+        WebpLog.d(TAG, "decodeRawWebPToAnim: resId=$resId, bytes=${data.capacity()}, targetSize=$targetSize")
 
         val result = try {
-            if (targetSize != null && targetSize.width > 0 && targetSize.height > 0) {
-                // 使用指定尺寸解码
-                decodeAllFramesWithSize(bytes, targetSize.width, targetSize.height)?.also {
-                    // 将 targetSize 记录到结果中
-                    return WebPAnimResult(it.frames, it.canvasWidth, it.canvasHeight, it.durations)
-                }
-            } else {
-                // 使用原始尺寸解码
-                decodeAllFrames(bytes)
-            }
+            decodeAllFramesDirect(
+                data,
+                data.capacity(),
+                targetSize?.width ?: 0,
+                targetSize?.height ?: 0,
+            )
         } catch (t: Throwable) {
             WebpLog.e(TAG, "decode failed: ${t.message}", t)
             null
