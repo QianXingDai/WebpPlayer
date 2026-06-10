@@ -9,3 +9,4 @@ captures/
 .idea/
 *.log
 /mvn-repo/
+benchmark/build/
