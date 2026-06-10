@@ -55,38 +55,55 @@ object WebPAnimResultManager {
     fun getWebPAnimResult(resId: Int, size: Size? = null): WebPAnimResult? {
         val key = CacheKey(resId, size)
 
+        tryCloneFromCache(key)?.let { return it }
+
+        // 同一 key 的解码串行化：并发 miss 时只有第一个线程真正解码，
+        // 其余线程在锁上等它完成后直接命中缓存（之前会各解一次、丢一份）
+        return withKeyLock(key) {
+            tryCloneFromCache(key)?.let { return@withKeyLock it }
+
+            logD("getWebPAnimResult: cache miss, decoding once for $key")
+            val decoded = runCatching {
+                decodeDelegate(key.resId, key.size)
+            }.onFailure {
+                logE("decode failed for caller: $key, ${it.message}")
+            }.getOrNull() ?: return@withKeyLock null
+
+            synchronized(cacheLock) {
+                val existing = webPAnimResultCache[key]
+                if (existing != null) {
+                    releaseAnimResult(decoded)
+                    return@withKeyLock cloneAnimResult(existing)
+                }
+
+                webPAnimResultCache[key] = decoded
+                val cloned = cloneAnimResult(decoded)
+                trimCacheLocked()
+                cloned
+            }
+        }
+    }
+
+    private fun tryCloneFromCache(key: CacheKey): WebPAnimResult? {
         synchronized(cacheLock) {
             webPAnimResultCache[key]?.let { cached ->
                 removedFlags.remove(key)
                 logD("getWebPAnimResult: cloned from cache: $key")
                 cloneAnimResult(cached)?.let { return it }
                 logW("getWebPAnimResult: clone failed, evict cache and decode again: $key")
-                val removed = webPAnimResultCache.remove(key)
-                if (removed != null) {
-                    releaseAnimResult(removed)
-                }
+                webPAnimResultCache.remove(key)?.let { releaseAnimResult(it) }
             }
         }
+        return null
+    }
 
-        logD("getWebPAnimResult: cache miss, decoding once for $key")
-        val decoded = runCatching {
-            decodeDelegate(resId, size)
-        }.onFailure {
-            logE("decode failed for caller: $key, ${it.message}")
-        }.getOrNull() ?: return null
+    // 每个 key 一把解码锁。条目数最多为不同资源 key 的数量（很小），不主动清理——
+    // 清理与 computeIfAbsent 并发会产生两把锁，反而破坏去重。
+    private val decodeLocks = ConcurrentHashMap<CacheKey, Any>()
 
-        synchronized(cacheLock) {
-            val existing = webPAnimResultCache[key]
-            if (existing != null) {
-                releaseAnimResult(decoded)
-                return cloneAnimResult(existing)
-            }
-
-            webPAnimResultCache[key] = decoded
-            val cloned = cloneAnimResult(decoded)
-            trimCacheLocked()
-            return cloned
-        }
+    private inline fun <T> withKeyLock(key: CacheKey, block: () -> T): T {
+        val lock = decodeLocks.computeIfAbsent(key) { Any() }
+        return synchronized(lock) { block() }
     }
 
     private fun ensureRefillInBackground(key: CacheKey) {
@@ -98,11 +115,21 @@ object WebPAnimResultManager {
             return
         }
 
-        val deferred = WebpExecutors.globalAsyncScope.async {
-            logD("refill: start decoding for cache: $key")
-            val anim = runCatching { decodeDelegate(key.resId, key.size) }.onFailure {
-                logE("refill decode failed: $key, ${it.message}")
-            }.getOrNull()
+        // refill 也走解码 dispatcher：吃到并行度上限和后台线程优先级
+        val deferred = WebpExecutors.globalAsyncScope.async(
+            WebpDeviceProfile.current().decodeDispatcher()
+        ) {
+            // 与 getWebPAnimResult 共享同一把 key 锁：避免 refill 和直接取用并发双解码
+            val anim = withKeyLock(key) {
+                if (synchronized(cacheLock) { webPAnimResultCache.containsKey(key) }) {
+                    logD("refill: already cached by a concurrent getter, skip: $key")
+                    return@withKeyLock null
+                }
+                logD("refill: start decoding for cache: $key")
+                runCatching { decodeDelegate(key.resId, key.size) }.onFailure {
+                    logE("refill decode failed: $key, ${it.message}")
+                }.getOrNull()
+            }
 
             if (anim != null) {
                 val wasRemoved = removedFlags.remove(key)
@@ -152,8 +179,55 @@ object WebPAnimResultManager {
                 preloadWebpResIds.remove(key)
                 return@forEach
             }
+            if (!isWorthPreloading(key)) {
+                preloadWebpResIds.remove(key)
+                return@forEach
+            }
             ensureRefillInBackground(key)
         }
+    }
+
+    /**
+     * 预加载前置预判：只读容器头（不解码像素）估算解码成品大小，超出缓存预算的
+     * 直接跳过——缓存进去也会被立刻逐出，解码纯属白做（实测一次能省 1 秒级 CPU）。
+     * 拿不到元信息时不拦截，交给正常解码流程。
+     */
+    private fun isWorthPreloading(key: CacheKey): Boolean {
+        val budget = cacheBudgetBytesOverride ?: WebpDeviceProfile.current().cacheBudgetBytes
+        val info = runCatching {
+            WebPYUVDecoder.peekAnimInfo(WebpContext.get(), key.resId)
+        }.getOrNull() ?: return true
+        if (info.width <= 0 || info.height <= 0 || info.frameCount <= 0) return true
+
+        // 与 native ComputeFinalSize 同口径：aspect-fit、不放大、受 maxDecodePixels 约束
+        var w = info.width
+        var h = info.height
+        val target = key.size
+        if (target != null && target.width > 0 && target.height > 0) {
+            val scale = minOf(
+                target.width.toDouble() / w,
+                target.height.toDouble() / h,
+                1.0,
+            )
+            w = (w * scale).toInt().coerceAtLeast(1)
+            h = (h * scale).toInt().coerceAtLeast(1)
+        }
+        val maxPixels = WebpDeviceProfile.current().maxDecodePixels
+        if (maxPixels > 0 && w.toLong() * h > maxPixels) {
+            val scale = kotlin.math.sqrt(maxPixels.toDouble() / (w.toLong() * h))
+            w = (w * scale).toInt().coerceAtLeast(1)
+            h = (h * scale).toInt().coerceAtLeast(1)
+        }
+
+        val estimatedBytes = info.frameCount.toLong() * w * h * 4
+        if (estimatedBytes > budget) {
+            logW(
+                "preload skipped: $key 预估 ${estimatedBytes / 1024}KB " +
+                    "(${info.frameCount}帧 ${w}x$h) 超出缓存预算 ${budget / 1024}KB，缓存后会被立刻逐出"
+            )
+            return false
+        }
+        return true
     }
 
     fun clear() {
