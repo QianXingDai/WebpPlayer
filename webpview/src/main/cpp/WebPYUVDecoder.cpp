@@ -10,6 +10,7 @@
 #include "webp/decode.h"
 #include "libyuv/scale_argb.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -236,9 +237,12 @@ bool EnsureEglProcs() {
 
 // Aspect-fit the original canvas inside the target box. Never upscales: a
 // target larger than the source keeps the original size (GPU sampling handles
-// magnification for free). Output dimensions are kept even (legacy contract of
-// WebPAnimResult) but never collapse below 2.
-void ComputeFinalSize(int origW, int origH, int targetW, int targetH, int* outW, int* outH) {
+// magnification for free). maxPixels (>0) additionally caps the decoded area
+// (w*h), force-downscaling oversized assets to protect low-end devices.
+// Output dimensions are kept even (legacy contract of WebPAnimResult) but
+// never collapse below 2.
+void ComputeFinalSize(
+    int origW, int origH, int targetW, int targetH, int maxPixels, int* outW, int* outH) {
   int w = origW;
   int h = origH;
   if (targetW > 0 && targetH > 0 && (targetW < origW || targetH < origH)) {
@@ -249,6 +253,17 @@ void ComputeFinalSize(int origW, int origH, int targetW, int targetH, int* outW,
       w = static_cast<int>(origW * scale + 0.5);
       h = static_cast<int>(origH * scale + 0.5);
     }
+  }
+  if (maxPixels > 0 &&
+      static_cast<int64_t>(w) * static_cast<int64_t>(h) > static_cast<int64_t>(maxPixels)) {
+    const double scale = std::sqrt(
+        static_cast<double>(maxPixels) / (static_cast<double>(w) * static_cast<double>(h)));
+    const int cappedW = static_cast<int>(w * scale);
+    const int cappedH = static_cast<int>(h * scale);
+    LOGI("ComputeFinalSize: %dx%d exceeds maxPixels=%d, capped to %dx%d",
+         w, h, maxPixels, cappedW, cappedH);
+    w = cappedW;
+    h = cappedH;
   }
   if (w != origW || h != origH) {
     w &= ~1;
@@ -281,6 +296,7 @@ jobject DecodeAllFramesCore(
     size_t size,
     int targetW,
     int targetH,
+    int maxPixels,
     bool useHardwareBuffers) {
   if (bytes == nullptr || size == 0) {
     LOGE("decode: empty input");
@@ -317,7 +333,7 @@ jobject DecodeAllFramesCore(
 
   int finalW = origW;
   int finalH = origH;
-  ComputeFinalSize(origW, origH, targetW, targetH, &finalW, &finalH);
+  ComputeFinalSize(origW, origH, targetW, targetH, maxPixels, &finalW, &finalH);
   const bool needScale = (finalW != origW || finalH != origH);
   const size_t frameSize = static_cast<size_t>(finalW) * static_cast<size_t>(finalH) * 4;
 
@@ -560,7 +576,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFrames(JNIEnv* env, jobject, jbyt
 
   jobject result = DecodeAllFramesCore(
       env, reinterpret_cast<const uint8_t*>(input), static_cast<size_t>(length), 0, 0,
-      /*useHardwareBuffers=*/false);
+      /*maxPixels=*/0, /*useHardwareBuffers=*/false);
 
   env->ReleaseByteArrayElements(data, input, JNI_ABORT);
   return result;
@@ -580,7 +596,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesWithSize(
 
   jobject result = DecodeAllFramesCore(
       env, reinterpret_cast<const uint8_t*>(input), static_cast<size_t>(length),
-      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
+      targetWidth, targetHeight, /*maxPixels=*/0, /*useHardwareBuffers=*/false);
 
   env->ReleaseByteArrayElements(data, input, JNI_ABORT);
   return result;
@@ -607,7 +623,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirect(
   }
   return DecodeAllFramesCore(
       env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
-      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
+      targetWidth, targetHeight, /*maxPixels=*/0, /*useHardwareBuffers=*/false);
 }
 
 // Like decodeAllFramesDirect, with an opt-in zero-copy mode: frames decode
@@ -622,6 +638,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirectEx(
     jint dataSize,
     jint targetWidth,
     jint targetHeight,
+    jint maxPixels,
     jboolean preferHardware) {
   if (buffer == nullptr || dataSize <= 0) return nullptr;
   void* addr = env->GetDirectBufferAddress(buffer);
@@ -635,7 +652,7 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirectEx(
   if (preferHardware == JNI_TRUE) {
     jobject result = DecodeAllFramesCore(
         env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
-        targetWidth, targetHeight, /*useHardwareBuffers=*/true);
+        targetWidth, targetHeight, maxPixels, /*useHardwareBuffers=*/true);
     if (result != nullptr) return result;
     if (env->ExceptionCheck()) env->ExceptionClear();
     LOGE("decodeAllFramesDirectEx: hardware-buffer path failed, falling back to software");
@@ -643,7 +660,38 @@ Java_io_webpkit_player_WebPYUVDecoder_decodeAllFramesDirectEx(
 
   return DecodeAllFramesCore(
       env, static_cast<const uint8_t*>(addr), static_cast<size_t>(dataSize),
-      targetWidth, targetHeight, /*useHardwareBuffers=*/false);
+      targetWidth, targetHeight, maxPixels, /*useHardwareBuffers=*/false);
+}
+
+// Container-header peek: parses chunk headers only (no pixel decode), so a
+// caller can estimate decoded size before committing CPU to a full decode.
+// Returns [canvasWidth, canvasHeight, frameCount, loopCount, hasAlpha] or null.
+JNIEXPORT jintArray JNICALL
+Java_io_webpkit_player_WebPYUVDecoder_getAnimInfo(
+    JNIEnv* env, jobject, jobject buffer, jint dataSize) {
+  if (buffer == nullptr || dataSize <= 0) return nullptr;
+  void* addr = env->GetDirectBufferAddress(buffer);
+  const jlong cap = env->GetDirectBufferCapacity(buffer);
+  if (addr == nullptr || cap < static_cast<jlong>(dataSize)) return nullptr;
+
+  WebPData webp_data;
+  webp_data.bytes = static_cast<const uint8_t*>(addr);
+  webp_data.size = static_cast<size_t>(dataSize);
+  WebPDemuxer* dmux = WebPDemux(&webp_data);
+  if (dmux == nullptr) return nullptr;
+
+  jint vals[5];
+  vals[0] = static_cast<jint>(WebPDemuxGetI(dmux, WEBP_FF_CANVAS_WIDTH));
+  vals[1] = static_cast<jint>(WebPDemuxGetI(dmux, WEBP_FF_CANVAS_HEIGHT));
+  vals[2] = static_cast<jint>(WebPDemuxGetI(dmux, WEBP_FF_FRAME_COUNT));
+  vals[3] = static_cast<jint>(WebPDemuxGetI(dmux, WEBP_FF_LOOP_COUNT));
+  vals[4] = (WebPDemuxGetI(dmux, WEBP_FF_FORMAT_FLAGS) & ALPHA_FLAG) ? 1 : 0;
+  WebPDemuxDelete(dmux);
+
+  jintArray arr = env->NewIntArray(5);
+  if (arr == nullptr) return nullptr;
+  env->SetIntArrayRegion(arr, 0, 5, vals);
+  return arr;
 }
 
 // Clone = one new Java HardwareBuffer wrapper per frame, each holding its own

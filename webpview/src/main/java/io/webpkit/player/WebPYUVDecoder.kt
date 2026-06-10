@@ -58,14 +58,19 @@ object WebPYUVDecoder {
     ): WebPAnimResult?
 
     // JNI: 同上，preferHardware=true 时帧直写 AHardwareBuffer（结果在 hardwareFrames），
-    // 硬件分配失败自动回退软路径
+    // 硬件分配失败自动回退软路径；maxPixels>0 时解码输出面积超限会强制等比降采样
     external fun decodeAllFramesDirectEx(
         data: ByteBuffer,
         dataSize: Int,
         targetWidth: Int,
         targetHeight: Int,
+        maxPixels: Int,
         preferHardware: Boolean,
     ): WebPAnimResult?
+
+    // JNI: 只解析容器头（不解码像素，微秒级），返回
+    // [canvasWidth, canvasHeight, frameCount, loopCount, hasAlpha(0/1)]
+    external fun getAnimInfo(data: ByteBuffer, dataSize: Int): IntArray?
 
     // JNI: HardwareBuffer 帧的 clone——每帧生成新的 Java 包装、各自持有底层
     // AHardwareBuffer 的一个引用（零拷贝），释放用 HardwareBuffer.close()
@@ -86,6 +91,35 @@ object WebPYUVDecoder {
     // JNI: cloneNativeBuffers(frames) -> deep-copied native-backed direct ByteBuffers
     external fun cloneNativeBuffers(frames: Array<ByteBuffer>?): Array<ByteBuffer>?
 
+
+    /** 容器头信息（不解码像素即可获得），用于解码前的成本预估。 */
+    class WebpAnimInfo(
+        val width: Int,
+        val height: Int,
+        val frameCount: Int,
+        val loopCount: Int,
+        val hasAlpha: Boolean,
+    )
+
+    /**
+     * 只读容器头，返回画布尺寸/帧数等元信息。文件读取是主要成本（像素不解码），
+     * 适合预加载前估算「解码后会占多少内存」。失败返回 null。
+     */
+    fun peekAnimInfo(context: Context, resId: Int): WebpAnimInfo? {
+        if (!nativeLoaded) return null
+        return try {
+            val data = context.resources.openRawResource(resId).use { input ->
+                val bytes = input.readBytes()
+                if (bytes.isEmpty()) return null
+                ByteBuffer.allocateDirect(bytes.size).apply { put(bytes); position(0) }
+            }
+            val v = getAnimInfo(data, data.capacity()) ?: return null
+            WebpAnimInfo(v[0], v[1], v[2], v[3], v[4] != 0)
+        } catch (t: Throwable) {
+            WebpLog.w(TAG, "peekAnimInfo failed resId=$resId: ${t.message}")
+            null
+        }
+    }
 
     fun decodeRawWebPToAnim(context: Context, resId: Int, targetSize: Size? = null): WebPAnimResult? {
         if (!nativeLoaded) {
@@ -112,13 +146,15 @@ object WebPYUVDecoder {
         }
         WebpLog.d(TAG, "decodeRawWebPToAnim: resId=$resId, bytes=${data.capacity()}, targetSize=$targetSize")
 
+        val profile = WebpDeviceProfile.current()
         val result = try {
             decodeAllFramesDirectEx(
                 data,
                 data.capacity(),
                 targetSize?.width ?: 0,
                 targetSize?.height ?: 0,
-                hardwareBuffersEnabled,
+                profile.maxDecodePixels,
+                hardwareBuffersEnabled && profile.hardwareBuffers,
             )
         } catch (t: Throwable) {
             WebpLog.e(TAG, "decode failed: ${t.message}", t)
