@@ -102,13 +102,76 @@ open class WebpGLView @JvmOverloads constructor(
         WebpLog.d(TAG, "[WebpGLView#$instanceId] deviceProfile=${deviceProfile.name}, decodeParallelism=${deviceProfile.decodeParallelism}, cacheBudget=${deviceProfile.cacheBudgetBytes}")
 
         setEGLContextClientVersion(2)
-        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        // 不申请 depth/stencil：纯 2D 合成用不到，省一块 surface 内存
+        setEGLConfigChooser(8, 8, 8, 8, 0, 0)
         holder.setFormat(PixelFormat.TRANSLUCENT)
         setRenderer(renderer)
         preserveEGLContextOnPause = true
         // 按需渲染，由 renderer 定时 requestRender，避免 GL 线程空转阻塞
         renderMode = RENDERMODE_WHEN_DIRTY
         setZOrderOnTop(true)
+    }
+
+    /**
+     * 是否向系统声明播放帧率（API 30+ Surface.setFrameRate）。
+     *
+     * **默认关闭**：支持渲染帧率切换的设备会按本 surface 的低帧率投票把**整个屏幕**
+     * 的渲染率往下拖（实测 Adreno610 设备 60Hz 面板被压到 30/15fps 渲染），页面上
+     * 其它 UI 跟着卡。只有 webp 动画独占整屏、且希望省电时才应打开。
+     */
+    @Volatile
+    var frameRateHintEnabled: Boolean = false
+
+    /** 显式全局帧率投票，0 = 未设置。见 [setGlobalFrameRate]。 */
+    @Volatile
+    private var globalFrameRateVote: Int = 0
+
+    /**
+     * 主动向系统投一张帧率票（API 30+ Surface.setFrameRate），用于**有意**影响整机
+     * 渲染帧率以省电。范围强制夹在 30-60：uid 级 frameRateOverride 会把同应用所有
+     * UI 的 vsync 一起降到投票值附近，低于 30 时页面操作会有明显卡顿感，故不放开。
+     *
+     * 优先级高于 [frameRateHintEnabled] 的播放帧率提示，且不随 start/stop 变化；
+     * surface 重建后会自动重新声明。传 fps <= 0 清除投票，恢复系统默认调度。
+     */
+    fun setGlobalFrameRate(fps: Int) {
+        globalFrameRateVote = if (fps <= 0) 0 else fps.coerceIn(30, 60)
+        WebpLog.i(TAG, "[WebpGLView#$instanceId] setGlobalFrameRate: $fps -> vote=$globalFrameRateVote")
+        setSurfaceFrameRate(globalFrameRateVote)
+    }
+
+    private fun applyFrameRateHint(fps: Int) {
+        // 显式全局投票优先，播放状态变化不得覆盖它
+        if (globalFrameRateVote > 0) {
+            setSurfaceFrameRate(globalFrameRateVote)
+            return
+        }
+        if (!frameRateHintEnabled) return
+        setSurfaceFrameRate(fps)
+    }
+
+    private fun setSurfaceFrameRate(fps: Int) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return
+        try {
+            val surface = holder.surface ?: return
+            if (!surface.isValid) return
+            surface.setFrameRate(
+                if (fps > 0) fps.toFloat() else 0f,
+                android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
+            )
+        } catch (t: Throwable) {
+            WebpLog.w(TAG, "[WebpGLView#$instanceId] setFrameRate failed: ${t.message}")
+        }
+    }
+
+    override fun surfaceChanged(holder: android.view.SurfaceHolder, format: Int, w: Int, h: Int) {
+        super.surfaceChanged(holder, format, w, h)
+        // surface 重建后重新声明帧率偏好（全局投票优先）
+        if (globalFrameRateVote > 0) {
+            setSurfaceFrameRate(globalFrameRateVote)
+        } else if (isAnimating) {
+            applyFrameRateHint(lastFps)
+        }
     }
 
     @Volatile
@@ -139,6 +202,7 @@ open class WebpGLView @JvmOverloads constructor(
             startTime = SystemClock.uptimeMillis()
             WebpLog.d(TAG, "[WebpGLView#$instanceId] Animation started (active: $activeInstances)")
         }
+        applyFrameRateHint(lastFps)
 
         // 有限循环动画播完后帧内存已回收：重播需要重新加载（缓存命中时只是引用计数+1，很便宜）
         val replayRes = resId
@@ -165,7 +229,7 @@ open class WebpGLView @JvmOverloads constructor(
             }
             queueEvent {
                 if (isDestroyed) {
-                    anim.frames?.let { runCatching { WebPYUVDecoder.releaseNativeBuffers(it) } }
+                    anim.releaseNative()
                     return@queueEvent
                 }
                 renderer.setFromAnimResult(anim, lastSize, lastFps)
@@ -181,6 +245,7 @@ open class WebpGLView @JvmOverloads constructor(
             val duration = SystemClock.uptimeMillis() - startTime
             WebpLog.d(TAG, "[WebpGLView#$instanceId] Animation stopped after ${duration}ms (active: $activeInstances)")
         }
+        applyFrameRateHint(0)
 
         queueEvent { renderer.stop() }
     }
@@ -221,7 +286,7 @@ open class WebpGLView @JvmOverloads constructor(
             // 传入 size 参数给 Manager
             val anim = WebPAnimResultManager.getWebPAnimResult(resId, size)
             val decodeTime = System.currentTimeMillis() - startTime
-            WebpLog.d(TAG, "[WebpGLView#$instanceId] setWebpFromRaw: decoded resId=$resId in ${decodeTime}ms, frames=${anim?.frames?.size}")
+            WebpLog.d(TAG, "[WebpGLView#$instanceId] setWebpFromRaw: decoded resId=$resId in ${decodeTime}ms, frames=${anim?.frameCount}(hw=${anim?.hardwareFrames != null})")
 
             // 再次检查是否被销毁
             if (isDestroyed) {

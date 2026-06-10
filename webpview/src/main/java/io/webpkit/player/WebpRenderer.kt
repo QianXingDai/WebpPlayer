@@ -1,10 +1,12 @@
 package io.webpkit.player
 
+import android.hardware.HardwareBuffer
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.os.SystemClock
 import android.util.Size
+import android.view.Choreographer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -69,9 +71,16 @@ class WebpRenderer(
     private var uMvpLoc = 0
     private var texSamplerLoc = 0
 
-    // single texture for RGBA pipeline
+    // single texture for RGBA pipeline (software/ByteBuffer mode)
     private val texIds = IntArray(1)
     private var textureAllocated = false
+
+    // ===== 零拷贝模式（AHardwareBuffer + EGLImage）=====
+    // 每帧一个 texture + EGLImage，加载时建好；播放时只换 glBindTexture，无任何上传
+    private var hardwareFrames: Array<HardwareBuffer>? = null
+    private var hwTextures = IntArray(0)
+    private var hwImages = LongArray(0)
+    private val hwActive: Boolean get() = hardwareFrames != null
 
     private var viewWidth = 0
     private var viewHeight = 0
@@ -174,7 +183,7 @@ class WebpRenderer(
 
     fun start() {
         playing = true
-        frameHandler.removeCallbacksAndMessages(null)
+        cancelScheduledFrame()
         lastFrameTimeMs = SystemClock.uptimeMillis()
         requestRender()
     }
@@ -197,7 +206,8 @@ class WebpRenderer(
         playbackFinished = false
         currentFrameIndex = 0
         lastFrameTimeMs = SystemClock.uptimeMillis()
-        if (frames?.isNotEmpty() == true && program != 0) {
+        // 硬件模式绑定发生在 onDrawFrame，软件模式需要重新上传第 0 帧
+        if (!hwActive && frames?.isNotEmpty() == true && program != 0) {
             uploadCurrentFrameRGBA()
         }
         requestRender()
@@ -206,6 +216,33 @@ class WebpRenderer(
     /** 播放完成：停在当前（末）帧，回收其余帧的 native 内存。 */
     private fun finishPlayback() {
         playbackFinished = true
+
+        // 硬件模式：保留当前帧的 buffer/texture/EGLImage，释放其余
+        hardwareFrames?.let { hw ->
+            if (hw.size <= 1) return
+            val keepIdx = currentFrameIndex.coerceIn(0, hw.size - 1)
+            for (i in hw.indices) {
+                if (i == keepIdx) continue
+                runCatching { if (!hw[i].isClosed) hw[i].close() }
+                if (hwImages.getOrElse(i) { 0L } != 0L) {
+                    runCatching { WebPYUVDecoder.eglImageDestroy(hwImages[i]) }
+                }
+            }
+            if (hwTextures.size == hw.size) {
+                val toDelete = IntArray(hw.size - 1)
+                var j = 0
+                for (i in hwTextures.indices) if (i != keepIdx) toDelete[j++] = hwTextures[i]
+                runCatching { GLES20.glDeleteTextures(toDelete.size, toDelete, 0) }
+                hwTextures = intArrayOf(hwTextures[keepIdx])
+            }
+            hwImages = longArrayOf(hwImages.getOrElse(keepIdx) { 0L })
+            hardwareFrames = arrayOf(hw[keepIdx])
+            currentFrameIndex = 0
+            framesTrimmed = true
+            WebpLog.i(TAG, "finishPlayback: 播放完成(loop=$loopCount)，回收 ${hw.size - 1} 个硬件帧")
+            return
+        }
+
         val f = frames ?: return
         if (f.size <= 1) return
         val keepIdx = currentFrameIndex.coerceIn(0, f.size - 1)
@@ -227,7 +264,7 @@ class WebpRenderer(
 
     fun stop() {
         playing = false
-        frameHandler.removeCallbacksAndMessages(null)
+        cancelScheduledFrame()
     }
 
     fun setContentLayout(
@@ -243,7 +280,7 @@ class WebpRenderer(
 
     // 新增重载：从 WebPAnimResult 设置帧并可指定 targetSize/fps（必须在 GL 线程或 queueEvent 中调用）
     fun setFromAnimResult(anim: WebPAnimResult, targetSize: Size? = null, fps: Int = 0) {
-        WebpLog.d(TAG, "setFromAnimResult: frames=${anim.frames?.size}, size=${anim.canvasWidth}x${anim.canvasHeight}, targetSize=$targetSize, fps=$fps")
+        WebpLog.d(TAG, "setFromAnimResult: frames=${anim.frameCount}(hw=${anim.hardwareFrames != null}), size=${anim.canvasWidth}x${anim.canvasHeight}, targetSize=$targetSize, fps=$fps")
 
         // store overrides
         pendingRenderSize = targetSize
@@ -280,15 +317,8 @@ class WebpRenderer(
         val old = pendingAnim
         pendingAnim = anim
         if (old != null && old !== anim) {
-            val stale = old.frames ?: return
-            try {
-                val freedKB = WebPYUVDecoder.releaseNativeBuffers(stale)
-                if (freedKB > 0) {
-                    WebpLog.d(TAG, "replacePendingAnim: released stale pendingAnim, freed $freedKB KB")
-                }
-            } catch (t: Throwable) {
-                WebpLog.e(TAG, "replacePendingAnim: release stale pendingAnim failed: ${t.message}")
-            }
+            old.releaseNative()
+            WebpLog.d(TAG, "replacePendingAnim: released stale pendingAnim")
         }
     }
 
@@ -328,6 +358,16 @@ class WebpRenderer(
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         foregroundTextureAllocated = false
+
+        // context 重建后旧纹理全部失效：复位软件纹理状态并恢复已有内容
+        textureAllocated = false
+        if (hwActive) {
+            // 硬件帧仍在（AHardwareBuffer 不依赖 GL context），重建 texture + EGLImage 绑定
+            rebuildHardwareTextures()
+        } else if (frames?.isNotEmpty() == true) {
+            ensureTextureAllocated()
+            uploadCurrentFrameRGBA()
+        }
 
         // apply pending anim if any
         pendingAnim?.let {
@@ -389,25 +429,26 @@ class WebpRenderer(
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        val f = frames
-        if (f == null || f.isEmpty()) {
+        val count = currentFrameCount()
+        if (count == 0) {
             // 节流打印：避免 60fps 刷屏，但又能在「看不到 webp」时确认渲染线程是否拿到了帧
             val now = SystemClock.uptimeMillis()
             if (now - lastNoFrameLogMs > 1000) {
                 lastNoFrameLogMs = now
-                WebpLog.w(TAG, "onDrawFrame: 没有可渲染的帧 (frames=${if (f == null) "null" else "empty"}, playing=$playing) —— 屏幕为空白")
+                WebpLog.w(TAG, "onDrawFrame: 没有可渲染的帧 (playing=$playing) —— 屏幕为空白")
             }
             return
         }
 
         if (!firstFrameLogged) {
             firstFrameLogged = true
-            WebpLog.i(TAG, "onDrawFrame: 首帧绘制 frames=${f.size}, frame=${frameWidth}x${frameHeight}, view=${viewWidth}x${viewHeight}, playing=$playing")
+            WebpLog.i(TAG, "onDrawFrame: 首帧绘制 frames=$count(hw=$hwActive), frame=${frameWidth}x${frameHeight}, view=${viewWidth}x${viewHeight}, playing=$playing")
         }
 
         // 单帧（静态 webp）没有动画可推进；播放完成的有限循环动画停在末帧。
         // 两种情况都画完即止，不再定时唤醒重复上传同一帧
-        if (!playing || f.size <= 1 || playbackFinished) {
+        if (!playing || count <= 1 || playbackFinished) {
+            bindCurrentTexture()
             drawQuad()
             drawForeground()
             return
@@ -418,32 +459,127 @@ class WebpRenderer(
         val elapsed = now - lastFrameTimeMs
 
         if (elapsed >= dur) {
-            val atLastFrame = currentFrameIndex == f.size - 1
+            val atLastFrame = currentFrameIndex == count - 1
             if (atLastFrame && loopCount > 0 && completedLoops + 1 >= loopCount) {
                 // 有限循环播放完毕：停在末帧并回收其余帧内存
                 completedLoops = loopCount
                 finishPlayback()
+                bindCurrentTexture()
                 drawQuad()
                 drawForeground()
                 return
             }
             if (atLastFrame) completedLoops++
-            currentFrameIndex = (currentFrameIndex + 1) % f.size
-            // 累加而非重置为 now：每帧丢弃余量会让动画整体变慢；
-            // 但落后超过一帧（如长时间暂停后）直接对齐，避免追帧狂奔
-            lastFrameTimeMs += dur
-            if (now - lastFrameTimeMs >= dur) {
-                lastFrameTimeMs = now
+            currentFrameIndex = (currentFrameIndex + 1) % count
+            if (fpsOverride > 0) {
+                // 固定 fps：推进时刻锚定到绝对时间网格（uptime 对 dur 取模）。
+                // 相同 fps 的所有动画——包括不同 GLSurfaceView——会在同一个 vsync
+                // 推进/提交，SurfaceFlinger 合成次数随之合并（错相位时多个 18fps
+                // surface 会让 SF 每秒合成 30-40 次，对齐后回到 18 次）
+                lastFrameTimeMs = now - (now % dur)
+            } else {
+                // 可变帧时长：累加而非重置为 now，避免每帧丢余量整体变慢；
+                // 落后超一帧（如长时间暂停后）直接对齐，避免追帧狂奔
+                lastFrameTimeMs += dur
+                if (now - lastFrameTimeMs >= dur) {
+                    lastFrameTimeMs = now
+                }
             }
-            uploadCurrentFrameRGBA()
+            // 软件模式上传新帧；硬件模式帧已常驻 GPU，绘制前换绑定即可
+            if (!hwActive) {
+                uploadCurrentFrameRGBA()
+            }
         }
 
+        bindCurrentTexture()
         drawQuad()
         drawForeground()
 
         // 计算下一帧延迟并按需请求渲染，避免 GL 线程 sleep
         val nextDelay = (dur - (SystemClock.uptimeMillis() - lastFrameTimeMs)).coerceAtLeast(1)
-        frameHandler.postDelayed({ if (playing) requestRender() }, nextDelay)
+        scheduleNextFrame(nextDelay)
+    }
+
+    private fun currentFrameCount(): Int = hardwareFrames?.size ?: frames?.size ?: 0
+
+    /** 绘制前把当前帧对应的纹理绑到 TEXTURE0（两种模式统一入口） */
+    private fun bindCurrentTexture() {
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        if (hwActive) {
+            val idx = currentFrameIndex.coerceIn(0, hwTextures.size - 1)
+            if (idx >= 0 && hwTextures.isNotEmpty()) {
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, hwTextures[idx])
+            }
+        } else {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
+        }
+    }
+
+    /**
+     * 为硬件帧重建 GL 侧资源（GL 线程）：每帧一个 texture，绑定到其 AHardwareBuffer
+     * 的 EGLImage。EGLImage 创建失败时退化为「一次性 CPU 上传到该 texture」——
+     * 之后播放同样是零上传，只是加载时多了一轮拷贝。
+     */
+    private fun rebuildHardwareTextures() {
+        releaseHardwareTextures()
+        val hw = hardwareFrames ?: return
+        if (program == 0 || hw.isEmpty()) return
+
+        hwTextures = IntArray(hw.size)
+        hwImages = LongArray(hw.size)
+        GLES20.glGenTextures(hw.size, hwTextures, 0)
+        var fallbackCount = 0
+        for (i in hw.indices) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, hwTextures[i])
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            val image = try {
+                WebPYUVDecoder.eglImageCreate(hw[i])
+            } catch (t: Throwable) {
+                0L
+            }
+            hwImages[i] = image
+            if (image != 0L) {
+                WebPYUVDecoder.eglImageTargetTexture2D(image)
+            } else {
+                fallbackCount++
+                GLES20.glTexImage2D(
+                    GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                    frameWidth, frameHeight, 0,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+                )
+                try {
+                    WebPYUVDecoder.uploadHardwareBufferToTexture(hw[i], frameWidth, frameHeight)
+                } catch (t: Throwable) {
+                    WebpLog.e(TAG, "rebuildHardwareTextures: fallback upload failed: ${t.message}")
+                }
+            }
+        }
+        if (fallbackCount > 0) {
+            WebpLog.w(TAG, "rebuildHardwareTextures: $fallbackCount/${hw.size} 帧 EGLImage 创建失败，已用一次性上传兜底")
+        }
+    }
+
+    /** 删除硬件帧的 GL 资源（texture + EGLImage），不动 AHardwareBuffer 本体 */
+    private fun releaseHardwareTextures() {
+        if (hwTextures.isNotEmpty()) {
+            try {
+                GLES20.glDeleteTextures(hwTextures.size, hwTextures, 0)
+            } catch (_: Throwable) {
+            }
+            hwTextures = IntArray(0)
+        }
+        for (image in hwImages) {
+            if (image != 0L) {
+                try {
+                    WebPYUVDecoder.eglImageDestroy(image)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        hwImages = LongArray(0)
     }
 
     private fun ensureTextureAllocated() {
@@ -603,22 +739,24 @@ class WebpRenderer(
 
     // 将原本在 setAnimatedFrames 中对 GL 的操作提取到这里（必须在 GL 线程并且在 GL 已就绪时调用）
     private fun applyAnimResult(anim: WebPAnimResult) {
-        // copy frames array (keep direct buffers)
+        val hw = anim.hardwareFrames
         val arr = anim.frames
-        if (arr == null) {
-            WebpLog.w(TAG, "applyAnimResult: anim.frames 为 null，无内容可渲染")
+        if (hw == null && arr == null) {
+            WebpLog.w(TAG, "applyAnimResult: anim 无帧数据，无内容可渲染")
             return
         }
-        if (arr.isEmpty()) {
+        val count = hw?.size ?: arr!!.size
+        if (count == 0) {
             WebpLog.w(TAG, "applyAnimResult: 0 帧，无内容可渲染")
         }
-        this.frames = arr
+        this.hardwareFrames = hw
+        this.frames = if (hw == null) arr else null
         this.frameWidth = anim.canvasWidth
         this.frameHeight = anim.canvasHeight
         // apply fps override if set
         if (fpsOverride > 0) {
             val fixed = (1000f / fpsOverride).toInt().coerceAtLeast(1)
-            this.frameDurations = IntArray(arr.size) { fixed }
+            this.frameDurations = IntArray(count) { fixed }
         } else {
             this.frameDurations = anim.durations
         }
@@ -642,20 +780,25 @@ class WebpRenderer(
         firstFrameLogged = false
         textureAllocated = false // ensure allocation occurs below
 
-        // allocate texture storage and upload first frame immediately to avoid black first frame
-        ensureTextureAllocated()
-        if (arr.isNotEmpty()) {
-            val first = arr[0]
-            try { first.position(0) } catch (t: Throwable) { try { first.rewind() } catch (_: Throwable) {} }
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
-            GLES20.glTexSubImage2D(
-                GLES20.GL_TEXTURE_2D, 0, 0, 0,
-                frameWidth, frameHeight,
-                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, first
-            )
+        if (hw != null) {
+            // 零拷贝路径：一次性建好全部 texture/EGLImage，之后播放零上传
+            rebuildHardwareTextures()
+        } else {
+            // 软件路径：allocate texture storage and upload first frame immediately
+            ensureTextureAllocated()
+            if (arr!!.isNotEmpty()) {
+                val first = arr[0]
+                try { first.position(0) } catch (t: Throwable) { try { first.rewind() } catch (_: Throwable) {} }
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texIds[0])
+                GLES20.glTexSubImage2D(
+                    GLES20.GL_TEXTURE_2D, 0, 0, 0,
+                    frameWidth, frameHeight,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, first
+                )
+            }
         }
         computeMvp()
-        WebpLog.i(TAG, "applyAnimResult 完成: frames=${arr.size}, frame=${frameWidth}x${frameHeight}, render=${renderWidth}x${renderHeight}, view=${viewWidth}x${viewHeight}, fpsOverride=$fpsOverride")
+        WebpLog.i(TAG, "applyAnimResult 完成: frames=$count(hw=${hw != null}), frame=${frameWidth}x${frameHeight}, render=${renderWidth}x${renderHeight}, view=${viewWidth}x${viewHeight}, fpsOverride=$fpsOverride")
         // 不再需要手动请求渲染，RENDERMODE_CONTINUOUSLY 会自动渲染
     }
 
@@ -726,6 +869,18 @@ class WebpRenderer(
      * @return 释放的内存大小（KB），失败返回0
      */
     fun releaseFrames(): Int {
+        // 硬件帧：先删 GL 资源（texture/EGLImage），再 close buffer（AHB 引用计数）
+        if (hardwareFrames != null) {
+            releaseHardwareTextures()
+            hardwareFrames?.forEach { hb ->
+                try {
+                    if (!hb.isClosed) hb.close()
+                } catch (_: Throwable) {
+                }
+            }
+            hardwareFrames = null
+        }
+
         val f = frames ?: return 0
         var freedKB = 0
         try {
@@ -744,7 +899,7 @@ class WebpRenderer(
      * 在 GL 线程调用：释放 GL 相关资源（texture / program）以及 frame buffers
      */
     fun releaseAndCleanup(): Int {
-        frameHandler.removeCallbacksAndMessages(null)
+        cancelScheduledFrame()
         var freedKB = 0
         try {
             // stop rendering
@@ -830,4 +985,29 @@ class WebpRenderer(
     }
 
     private val frameHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    // Choreographer 调度：帧 tick 落在 vsync 上（postFrameCallbackDelayed 在延迟到期后的
+    // 下一个 vsync 触发），避免 postDelayed 落在帧中间导致的无效唤醒/迟到一帧。
+    // renderer 在主线程构造，getInstance 绑定主线程 looper；拿不到时回退 Handler。
+    private val choreographer: Choreographer? = try {
+        Choreographer.getInstance()
+    } catch (_: Throwable) {
+        null
+    }
+    private val frameCallback = Choreographer.FrameCallback { if (playing) requestRender() }
+
+    private fun scheduleNextFrame(delayMs: Long) {
+        val ch = choreographer
+        if (ch != null) {
+            ch.removeFrameCallback(frameCallback)
+            ch.postFrameCallbackDelayed(frameCallback, delayMs)
+        } else {
+            frameHandler.postDelayed({ if (playing) requestRender() }, delayMs)
+        }
+    }
+
+    private fun cancelScheduledFrame() {
+        choreographer?.removeFrameCallback(frameCallback)
+        frameHandler.removeCallbacksAndMessages(null)
+    }
 }

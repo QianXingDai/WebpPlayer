@@ -29,7 +29,7 @@ import kotlin.math.roundToInt
  * container.unfreezeLayer(1)  // hand layer #1 back to the GL surface
  * ```
  */
-class MultiWebpGLViewContainer @JvmOverloads constructor(
+open class MultiWebpGLViewContainer @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
 ) : FrameLayout(context, attrs) {

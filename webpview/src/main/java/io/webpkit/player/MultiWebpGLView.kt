@@ -3,12 +3,14 @@ package io.webpkit.player
 import android.content.Context
 import android.graphics.PixelFormat
 import android.graphics.RectF
+import android.hardware.HardwareBuffer
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Choreographer
 import android.util.AttributeSet
 import android.util.Size
 import androidx.annotation.RawRes
@@ -68,11 +70,19 @@ private class LayerState(val config: WebpLayer) {
     @Volatile var posX: Float = config.x
     @Volatile var posY: Float = config.y
 
-    // Animation data
+    // Animation data (software/ByteBuffer mode)
     var frames: Array<ByteBuffer>? = null
     var frameDurations: IntArray = IntArray(0)
     var frameWidth: Int = 0
     var frameHeight: Int = 0
+
+    // Zero-copy mode (AHardwareBuffer + EGLImage): one texture per frame,
+    // playback just rebinds — no per-frame upload.
+    var hardwareFrames: Array<HardwareBuffer>? = null
+    var hwTextures: IntArray = IntArray(0)
+    var hwImages: LongArray = LongArray(0)
+
+    fun frameCount(): Int = hardwareFrames?.size ?: frames?.size ?: 0
 
     // Playback
     var currentFrameIndex: Int = 0
@@ -206,6 +216,30 @@ private class MultiRenderer(
         if (playing) requestRender()
     }
 
+    // Choreographer：帧 tick 对齐 vsync（延迟到期后的下一个 vsync 触发），
+    // 避免落在帧中间的无效唤醒。构造发生在主线程；拿不到时回退 Handler。
+    private val choreographer: Choreographer? = try {
+        Choreographer.getInstance()
+    } catch (_: Throwable) {
+        null
+    }
+    private val frameCallback = Choreographer.FrameCallback { if (playing) requestRender() }
+
+    private fun scheduleNextFrame(delayMs: Long) {
+        val ch = choreographer
+        if (ch != null) {
+            ch.removeFrameCallback(frameCallback)
+            ch.postFrameCallbackDelayed(frameCallback, delayMs)
+        } else {
+            frameHandler.postDelayed(frameTick, delayMs)
+        }
+    }
+
+    private fun cancelScheduledFrame() {
+        choreographer?.removeFrameCallback(frameCallback)
+        frameHandler.removeCallbacks(frameTick)
+    }
+
     // ---------------------------------------------------------------------------
 
     fun setLayers(newLayers: List<LayerState>) {
@@ -244,7 +278,7 @@ private class MultiRenderer(
 
     fun setCustomPlaying(shouldPlay: Boolean) {
         playing = shouldPlay
-        frameHandler.removeCallbacks(frameTick)
+        cancelScheduledFrame()
         if (shouldPlay) {
             layers.forEach { it.lastFrameTimeMs = SystemClock.uptimeMillis() }
         }
@@ -289,6 +323,9 @@ private class MultiRenderer(
             if (anim != null) {
                 applyAnim(layer, anim)
                 layer.pendingAnim = null
+            } else if (layer.hardwareFrames?.isNotEmpty() == true) {
+                // 硬件帧不依赖 GL context，重建 texture + EGLImage 绑定即可
+                rebuildLayerHardwareTextures(layer)
             } else if (layer.frames?.isNotEmpty() == true) {
                 // Surface was recreated (e.g. after a visibility toggle) but the
                 // decoded frames survived: re-upload the current frame now so the
@@ -317,7 +354,7 @@ private class MultiRenderer(
     }
 
     private fun drawFrameInternal() {
-        frameHandler.removeCallbacks(frameTick)
+        cancelScheduledFrame()
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         if (program == 0) return
 
@@ -344,12 +381,13 @@ private class MultiRenderer(
             }
             if (!layer.isVisible) return@forEach
 
-            val frames = layer.frames ?: return@forEach
-            if (frames.isEmpty()) return@forEach
-            if (!layer.textureAllocated) allocTexture(layer)
+            val count = layer.frameCount()
+            if (count == 0) return@forEach
+            val hwMode = layer.hardwareFrames != null
+            if (!hwMode && !layer.textureAllocated) allocTexture(layer)
 
             // 单帧图层无动画可推进；播放完成的有限循环图层停在末帧——都不再参与调度
-            if (playing && frames.size > 1 && !layer.playbackFinished) {
+            if (playing && count > 1 && !layer.playbackFinished) {
                 val fps = layer.effectiveFps()
                 val dur = if (fps > 0) {
                     (1000L / fps)
@@ -358,20 +396,28 @@ private class MultiRenderer(
                 }
                 val elapsed = now - layer.lastFrameTimeMs
                 if (elapsed >= dur) {
-                    val atLastFrame = layer.currentFrameIndex == frames.size - 1
+                    val atLastFrame = layer.currentFrameIndex == count - 1
                     if (atLastFrame && layer.loopCount > 0 && layer.completedLoops + 1 >= layer.loopCount) {
                         // 有限循环播完：停在末帧并回收其余帧内存
                         layer.completedLoops = layer.loopCount
                         finishLayerPlayback(layer)
                     } else {
                         if (atLastFrame) layer.completedLoops++
-                        layer.currentFrameIndex = (layer.currentFrameIndex + 1) % frames.size
-                        // 累加而非重置为 now，避免每帧丢余量导致整体变慢；落后超一帧则对齐
-                        layer.lastFrameTimeMs += dur
-                        if (now - layer.lastFrameTimeMs >= dur) {
-                            layer.lastFrameTimeMs = now
+                        layer.currentFrameIndex = (layer.currentFrameIndex + 1) % count
+                        if (fps > 0) {
+                            // 固定 fps：锚定到绝对时间网格，相同 fps 的各层（含其它
+                            // GLSurfaceView）在同一 vsync 推进，整面一次绘制推进多层，
+                            // SurfaceFlinger 合成次数从错相位的 ~N×fps 合并回 fps
+                            layer.lastFrameTimeMs = now - (now % dur)
+                        } else {
+                            // 可变帧时长：累加防漂移；落后超一帧则对齐
+                            layer.lastFrameTimeMs += dur
+                            if (now - layer.lastFrameTimeMs >= dur) {
+                                layer.lastFrameTimeMs = now
+                            }
                         }
-                        uploadFrame(layer)
+                        // 软件模式上传新帧；硬件模式帧常驻 GPU，draw 时换绑定即可
+                        if (!hwMode) uploadFrame(layer)
                     }
                 }
                 if (!layer.playbackFinished) {
@@ -381,8 +427,15 @@ private class MultiRenderer(
             }
 
             // Draw layer
+            val texToBind = if (hwMode) {
+                if (layer.hwTextures.isEmpty()) 0
+                else layer.hwTextures[layer.currentFrameIndex.coerceIn(0, layer.hwTextures.size - 1)]
+            } else {
+                layer.texId[0]
+            }
+            if (texToBind == 0) return@forEach
             GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, layer.mvp, 0)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, layer.texId[0])
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texToBind)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         }
 
@@ -391,7 +444,7 @@ private class MultiRenderer(
 
         // Schedule next frame wake-up (only if playing and there are frames)
         if (playing && nextWakeMs != Long.MAX_VALUE) {
-            frameHandler.postDelayed(frameTick, nextWakeMs)
+            scheduleNextFrame(nextWakeMs)
         }
     }
 
@@ -406,6 +459,33 @@ private class MultiRenderer(
      */
     private fun finishLayerPlayback(layer: LayerState) {
         layer.playbackFinished = true
+
+        // 硬件模式：保留当前帧的 buffer/texture/EGLImage，释放其余
+        layer.hardwareFrames?.let { hw ->
+            if (hw.size <= 1) return
+            val keepIdx = layer.currentFrameIndex.coerceIn(0, hw.size - 1)
+            for (i in hw.indices) {
+                if (i == keepIdx) continue
+                runCatching { if (!hw[i].isClosed) hw[i].close() }
+                if (layer.hwImages.getOrElse(i) { 0L } != 0L) {
+                    runCatching { WebPYUVDecoder.eglImageDestroy(layer.hwImages[i]) }
+                }
+            }
+            if (layer.hwTextures.size == hw.size) {
+                val toDelete = IntArray(hw.size - 1)
+                var j = 0
+                for (i in layer.hwTextures.indices) if (i != keepIdx) toDelete[j++] = layer.hwTextures[i]
+                runCatching { GLES20.glDeleteTextures(toDelete.size, toDelete, 0) }
+                layer.hwTextures = intArrayOf(layer.hwTextures[keepIdx])
+            }
+            layer.hwImages = longArrayOf(layer.hwImages.getOrElse(keepIdx) { 0L })
+            layer.hardwareFrames = arrayOf(hw[keepIdx])
+            layer.currentFrameIndex = 0
+            layer.framesTrimmed = true
+            WebpLog.i(TAG, "finishLayerPlayback: resId=${layer.config.resId} 播完(loop=${layer.loopCount})，回收 ${hw.size - 1} 个硬件帧")
+            return
+        }
+
         val f = layer.frames ?: return
         if (f.size <= 1) return
         val keepIdx = layer.currentFrameIndex.coerceIn(0, f.size - 1)
@@ -422,10 +502,54 @@ private class MultiRenderer(
         layer.framesTrimmed = true
     }
 
+    /**
+     * 为图层的硬件帧重建 GL 资源（GL 线程）：每帧一个 texture 绑定到 EGLImage。
+     * EGLImage 创建失败的帧退化为一次性 CPU 上传（之后播放同样零上传）。
+     */
+    private fun rebuildLayerHardwareTextures(layer: LayerState) {
+        layer.releaseHardwareGl()
+        val hw = layer.hardwareFrames ?: return
+        if (program == 0 || hw.isEmpty()) return
+
+        layer.hwTextures = IntArray(hw.size)
+        layer.hwImages = LongArray(hw.size)
+        GLES20.glGenTextures(hw.size, layer.hwTextures, 0)
+        var fallbackCount = 0
+        for (i in hw.indices) {
+            configureTexture(layer.hwTextures[i])
+            val image = try {
+                WebPYUVDecoder.eglImageCreate(hw[i])
+            } catch (t: Throwable) {
+                0L
+            }
+            layer.hwImages[i] = image
+            if (image != 0L) {
+                WebPYUVDecoder.eglImageTargetTexture2D(image)
+            } else {
+                fallbackCount++
+                GLES20.glTexImage2D(
+                    GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                    layer.frameWidth, layer.frameHeight, 0,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+                )
+                runCatching {
+                    WebPYUVDecoder.uploadHardwareBufferToTexture(hw[i], layer.frameWidth, layer.frameHeight)
+                }
+            }
+        }
+        if (fallbackCount > 0) {
+            WebpLog.w(TAG, "rebuildLayerHardwareTextures: resId=${layer.config.resId} $fallbackCount/${hw.size} 帧 EGLImage 失败，已一次性上传兜底")
+        }
+    }
+
     private fun applyAnim(layer: LayerState, anim: WebPAnimResult) {
         layer.releaseNativeFrames()
-        val arr = anim.frames ?: return
-        layer.frames          = arr
+        val hw = anim.hardwareFrames
+        val arr = anim.frames
+        if (hw == null && arr == null) return
+        val count = hw?.size ?: arr!!.size
+        layer.hardwareFrames  = hw
+        layer.frames          = if (hw == null) arr else null
         layer.frameWidth      = anim.canvasWidth
         layer.frameHeight     = anim.canvasHeight
         layer.currentFrameIndex = 0
@@ -438,7 +562,7 @@ private class MultiRenderer(
         val fps = layer.effectiveFps()
         layer.frameDurations = if (fps > 0) {
             val fixed = (1000f / fps).toInt().coerceAtLeast(1)
-            IntArray(arr.size) { fixed }
+            IntArray(count) { fixed }
         } else {
             anim.durations
         }
@@ -446,22 +570,28 @@ private class MultiRenderer(
         layer.textureAllocated = false
         layer.computeMvp(viewWidth, viewHeight)
 
-        // Ensure texture is allocated and first frame uploaded
-        if (program != 0) {
-            if (layer.texId[0] == 0) {
-                GLES20.glGenTextures(1, layer.texId, 0)
-                configureTexture(layer.texId[0])
-            }
-            allocTexture(layer)
-            if (arr.isNotEmpty()) {
-                safeRewind(arr[0])
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, layer.texId[0])
-                GLES20.glTexSubImage2D(
-                    GLES20.GL_TEXTURE_2D, 0, 0, 0,
-                    layer.frameWidth, layer.frameHeight,
-                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, arr[0]
-                )
-            }
+        if (program == 0) return
+
+        if (hw != null) {
+            // 零拷贝路径：一次性建好全部 texture/EGLImage
+            rebuildLayerHardwareTextures(layer)
+            return
+        }
+
+        // 软件路径：ensure texture is allocated and first frame uploaded
+        if (layer.texId[0] == 0) {
+            GLES20.glGenTextures(1, layer.texId, 0)
+            configureTexture(layer.texId[0])
+        }
+        allocTexture(layer)
+        if (arr!!.isNotEmpty()) {
+            safeRewind(arr[0])
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, layer.texId[0])
+            GLES20.glTexSubImage2D(
+                GLES20.GL_TEXTURE_2D, 0, 0, 0,
+                layer.frameWidth, layer.frameHeight,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, arr[0]
+            )
         }
     }
 
@@ -506,6 +636,7 @@ private class MultiRenderer(
     }
 
     fun releaseAll() {
+        cancelScheduledFrame()
         frameHandler.removeCallbacksAndMessages(null)
         playing = false
         layers.forEach { layer ->
@@ -569,10 +700,31 @@ private fun safeRewind(buf: ByteBuffer) {
 }
 
 private fun LayerState.releaseNativeFrames() {
-    val f = frames ?: return
-    try { WebPYUVDecoder.releaseNativeBuffers(f) } catch (_: Throwable) {}
+    frames?.let { try { WebPYUVDecoder.releaseNativeBuffers(it) } catch (_: Throwable) {} }
     frames = null
+    releaseHardwareGl()
+    hardwareFrames?.forEach { hb ->
+        try {
+            if (!hb.isClosed) hb.close()
+        } catch (_: Throwable) {
+        }
+    }
+    hardwareFrames = null
     textureAllocated = false
+}
+
+/** 删除图层硬件帧的 GL 资源（texture + EGLImage），不动 AHardwareBuffer 本体。GL 线程调用。 */
+private fun LayerState.releaseHardwareGl() {
+    if (hwTextures.isNotEmpty()) {
+        try { GLES20.glDeleteTextures(hwTextures.size, hwTextures, 0) } catch (_: Throwable) {}
+        hwTextures = IntArray(0)
+    }
+    hwImages.forEach { image ->
+        if (image != 0L) {
+            try { WebPYUVDecoder.eglImageDestroy(image) } catch (_: Throwable) {}
+        }
+    }
+    hwImages = LongArray(0)
 }
 
 /**
@@ -583,7 +735,7 @@ private fun LayerState.replacePendingAnim(anim: WebPAnimResult?) {
     val old = pendingAnim
     pendingAnim = anim
     if (old != null && old !== anim) {
-        old.frames?.let { try { WebPYUVDecoder.releaseNativeBuffers(it) } catch (_: Throwable) {} }
+        old.releaseNative()
     }
 }
 
@@ -641,12 +793,80 @@ open class MultiWebpGLView @JvmOverloads constructor(
     init {
         WebpLog.d(TAG, "deviceProfile=${deviceProfile.name}, decodeParallelism=${deviceProfile.decodeParallelism}, cacheBudget=${deviceProfile.cacheBudgetBytes}")
         setEGLContextClientVersion(2)
-        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        // 不申请 depth/stencil：纯 2D 合成用不到，省一块 surface 内存
+        setEGLConfigChooser(8, 8, 8, 8, 0, 0)
         holder.setFormat(PixelFormat.TRANSLUCENT)
         setRenderer(renderer)
         preserveEGLContextOnPause = true
         renderMode = RENDERMODE_WHEN_DIRTY
         setZOrderOnTop(true)
+    }
+
+    /**
+     * 是否向系统声明播放帧率（API 30+ Surface.setFrameRate，取各层显式 fps 最大值）。
+     *
+     * **默认关闭**：支持渲染帧率切换的设备会按本 surface 的低帧率投票把**整个屏幕**
+     * 的渲染率往下拖（实测 Adreno610 设备 60Hz 面板被压到 30/15fps 渲染），页面上
+     * 其它 UI 跟着卡。只有 webp 动画独占整屏、且希望省电时才应打开。
+     */
+    @Volatile
+    var frameRateHintEnabled: Boolean = false
+
+    /** 显式全局帧率投票，0 = 未设置。见 [setGlobalFrameRate]。 */
+    @Volatile
+    private var globalFrameRateVote: Int = 0
+
+    /**
+     * 主动向系统投一张帧率票（API 30+ Surface.setFrameRate），用于**有意**影响整机
+     * 渲染帧率以省电。范围强制夹在 30-60：uid 级 frameRateOverride 会把同应用所有
+     * UI 的 vsync 一起降到投票值附近，低于 30 时页面操作会有明显卡顿感，故不放开。
+     *
+     * 优先级高于 [frameRateHintEnabled] 的播放帧率提示，且不随 start/stop 变化；
+     * surface 重建后会自动重新声明。传 fps <= 0 清除投票，恢复系统默认调度。
+     */
+    fun setGlobalFrameRate(fps: Int) {
+        globalFrameRateVote = if (fps <= 0) 0 else fps.coerceIn(30, 60)
+        WebpLog.i(TAG, "setGlobalFrameRate: $fps -> vote=$globalFrameRateVote")
+        setSurfaceFrameRate(globalFrameRateVote)
+    }
+
+    private fun applyFrameRateHint(playingNow: Boolean) {
+        // 显式全局投票优先，播放状态变化不得覆盖它
+        if (globalFrameRateVote > 0) {
+            setSurfaceFrameRate(globalFrameRateVote)
+            return
+        }
+        if (!frameRateHintEnabled) return
+        val maxFps = if (playingNow) {
+            layerStates.maxOfOrNull { it.config.fps.coerceAtLeast(0) } ?: 0
+        } else {
+            0
+        }
+        setSurfaceFrameRate(maxFps)
+    }
+
+    private fun setSurfaceFrameRate(fps: Int) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return
+        try {
+            val surface = holder.surface ?: return
+            if (!surface.isValid) return
+            surface.setFrameRate(
+                if (fps > 0) fps.toFloat() else 0f,
+                android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
+            )
+        } catch (t: Throwable) {
+            WebpLog.w(TAG, "setFrameRate failed: ${t.message}")
+        }
+    }
+
+    override fun surfaceChanged(holder: android.view.SurfaceHolder, format: Int, w: Int, h: Int) {
+        super.surfaceChanged(holder, format, w, h)
+        // surface 重建后重新声明帧率偏好（全局投票优先）
+        if (globalFrameRateVote > 0) {
+            setSurfaceFrameRate(globalFrameRateVote)
+        } else if (renderer.playing) {
+            applyFrameRateHint(true)
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -739,6 +959,7 @@ open class MultiWebpGLView @JvmOverloads constructor(
         }
         renderer.setCustomPlaying(true)
         queueEvent { renderer.setCustomPlaying(true) }
+        applyFrameRateHint(true)
         requestRender()
     }
 
@@ -746,6 +967,7 @@ open class MultiWebpGLView @JvmOverloads constructor(
     fun stop() {
         renderer.setCustomPlaying(false)
         queueEvent { renderer.setCustomPlaying(false) }
+        applyFrameRateHint(false)
     }
 
     /** Whether playback is currently running. */
@@ -811,12 +1033,7 @@ open class MultiWebpGLView @JvmOverloads constructor(
     }
 
     private fun releaseAnimResult(anim: WebPAnimResult?) {
-        val frames = anim?.frames ?: return
-        try {
-            WebPYUVDecoder.releaseNativeBuffers(frames)
-        } catch (t: Throwable) {
-            WebpLog.w(TAG, "releaseAnimResult failed: ${t.message}")
-        }
+        anim.releaseNative()
     }
 
     // ---------------------------------------------------------------------------
