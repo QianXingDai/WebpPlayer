@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.4 (2026-06-10)
+
+### Performance
+- **Preload cost pre-check**: `preloadWebPAnimResults` now peeks the webp
+  container header (new `getAnimInfo` JNI, no pixel decode) and skips entries
+  whose decoded size would exceed the cache budget — previously such preloads
+  burned ~1s+ of CPU decoding animations that were evicted immediately.
+- **Concurrent decode dedup**: simultaneous cache misses for the same resource
+  now decode exactly once (per-key locking, shared with the async refill path);
+  previously each caller decoded its own copy and all but one were discarded.
+- **Decode threads run at background priority** on a dedicated pool, so bulk
+  decoding at startup no longer competes with the UI thread for little cores.
+  The async refill path now also respects the per-device parallelism cap.
+- **Relaxed cache profiles**: with refcounted clones the cache entry is the
+  only copy in memory, so budgets/entries grew accordingly
+  (sm6225: 8MB/1 → 24MB/3, mt8781: 20MB/2 → 32MB/4, default: 12MB/1 → 24MB/3).
+
+### New
+- `WebpDeviceProfile.maxDecodePixels`: per-SoC cap on decoded frame area;
+  oversized assets are force-downscaled in native to protect low-end devices.
+- `WebpDeviceProfile.hardwareBuffers`: per-SoC switch for the zero-copy path.
+- `WebPYUVDecoder.peekAnimInfo()`: cheap container-header metadata
+  (canvas size, frame count, loop count, alpha) without decoding pixels.
+
 ## 1.0.3 (2026-06-10)
 
 ### Performance
